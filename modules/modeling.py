@@ -260,7 +260,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                                        batch_first=True, bidirectional=False, num_layers=1)
 
         self.loss_fct = CrossEn()
-        self.frame_match_weight = 1.0
+        # self.frame_match_weight = 0.0
         self.visual_prompt_len = 4
         self.visual_prompt_encoder = VideoPromptEncoder(self.visual_prompt_len, vision_width, vision_patch_size)
 
@@ -292,19 +292,20 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             ### TODO: need to simplify the code to calculate similarity ####
             sim_matrix_semantic, sim_matrix_global = self.get_similarity_logits(sequence_output, visual_output, attention_mask, video_mask,
                                                     shaped=True, loose_type=self.loose_type)
-            # text2video
-            sim_loss1 = self.loss_fct(sim_matrix_semantic)
-            # video2text
-            sim_loss2 = self.loss_fct(sim_matrix_semantic.T)
-            sim_loss_semantic = (sim_loss1 + sim_loss2) / 2
-            loss = loss + self.frame_match_weight*sim_loss_semantic
+            # # text2video
+            # sim_loss1 = self.loss_fct(sim_matrix_semantic)
+            # # video2text
+            # sim_loss2 = self.loss_fct(sim_matrix_semantic.T)
+            # sim_loss_semantic = (sim_loss1 + sim_loss2) / 2
+            # loss = loss + self.frame_match_weight*sim_loss_semantic
 
             # text2video
             sim_loss1 = self.loss_fct(sim_matrix_global)
             # video2text
             sim_loss2 = self.loss_fct(sim_matrix_global.T)
             sim_loss_global = (sim_loss1 + sim_loss2) / 2
-            loss = loss + (1-self.frame_match_weight)*sim_loss_global
+            # loss = loss + (1-self.frame_match_weight)*sim_loss_global
+            loss = loss + sim_loss_global
 
             return loss
         else:
@@ -443,7 +444,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         frame_embedding_index = torch.arange(start=0, end=visual_output.shape[1], step=expand_times, dtype=torch.long,
                                                         device=visual_output.device)
         visual_output = visual_output[:, frame_embedding_index, :]
-        visual_output_original = visual_output_original[:, frame_embedding_index, :]
+        # visual_output_original = visual_output_original[:, frame_embedding_index, :]
         video_mask = video_mask[:, frame_embedding_index]
         #########################################################
         # video mask need to change due to more tokens in frame #
@@ -457,15 +458,15 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             attention_mask = allgather(attention_mask, self.task_config)
             torch.distributed.barrier()
 
-        # get frame sim
-        sim_matrix_semantic = self.get_frame_selectedcls_similarity(sequence_output, visual_output, attention_mask, video_mask)
-        # sim_matrix_semantic = self.get_global_similarity(sequence_output, visual_output, attention_mask, video_mask)
+        # # get frame sim
+        # sim_matrix_semantic = self.get_frame_selectedcls_similarity(sequence_output, visual_output, attention_mask, video_mask)
+        # # sim_matrix_semantic = self.get_global_similarity(sequence_output, visual_output, attention_mask, video_mask)
 
         # get global sim
         sim_matrix_global = self.get_frame_similarity(sequence_output, visual_output, attention_mask, video_mask)
         
 
-        return sim_matrix_global, sim_matrix_semantic
+        return sim_matrix_global, None
         # return retrieve_logits
 
     def get_global_similarity(self, sequence_output, visual_output, attention_mask, video_mask):
@@ -541,7 +542,8 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
     
     def get_final_similarity(self,sequence_output, visual_output, attention_mask, video_mask, shaped=False, loose_type=False):
         sim_matrix_semantic, sim_matrix_global = self.get_similarity_logits(sequence_output, visual_output, attention_mask, video_mask, shaped=shaped, loose_type=loose_type)
-        return self.frame_match_weight * sim_matrix_semantic + (1-self.frame_match_weight) * sim_matrix_global
+        # return self.frame_match_weight * sim_matrix_semantic + (1-self.frame_match_weight) * sim_matrix_global
+        return sim_matrix_global
     
     def get_frame_similarity(self, sequence_output, visual_output, attention_mask, video_mask):
         # sequence_output shape is (bs, 1, hid_dim), visual_output shape here is (bs, max_frames, hid_dim)
@@ -549,21 +551,24 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         sequence_output = sequence_output / sequence_output.norm(dim=-1, keepdim=True)
         visual_output = visual_output / visual_output.norm(dim=-1, keepdim=True)
+        visual_output = visual_output.mean(dim=1)
+        sequence_output = sequence_output.squeeze(dim=1)
+        similarity_matrix = torch.matmul(visual_output, sequence_output.T)
 
-        video_mask_un = video_mask.to(dtype=torch.bool).unsqueeze(-1)
-        ##################################################################
-        ## should change to visual matmul sequence due to match in test ##
-        ##################################################################
-        similarity_matrix = torch.einsum('mjk,nlk->mjn', visual_output, sequence_output)  # shape here should be(bs_v, max_frames, bs_s)
+        # video_mask_un = video_mask.to(dtype=torch.bool).unsqueeze(-1)
+        # ##################################################################
+        # ## should change to visual matmul sequence due to match in test ##
+        # ##################################################################
+        # similarity_matrix = torch.einsum('mjk,nlk->mjn', visual_output, sequence_output)  # shape here should be(bs_v, max_frames, bs_s)
 
-        similarity_matrix_weight = similarity_matrix * video_mask_un  # video_mask shape here is (bs_v, max_frames, 1)
-        ##########  softmax nomalize  ####################
-        similarity_matrix_weight = similarity_matrix_weight / similarity_matrix_weight.norm(dim=1, keepdim=True)
-        similarity_matrix_weight = similarity_matrix_weight.masked_fill_(~video_mask_un, -1e18)
-        similarity_matrix_weight = torch.softmax(4*similarity_matrix_weight, dim=1) # normalization between frames for each frame
-        similarity_matrix = similarity_matrix_weight * similarity_matrix
-        similarity_matrix = torch.sum(similarity_matrix, dim=1)
-        ##########  softmax nomalize  ####################
+        # similarity_matrix_weight = similarity_matrix * video_mask_un  # video_mask shape here is (bs_v, max_frames, 1)
+        # ##########  softmax nomalize  ####################
+        # similarity_matrix_weight = similarity_matrix_weight / similarity_matrix_weight.norm(dim=1, keepdim=True)
+        # similarity_matrix_weight = similarity_matrix_weight.masked_fill_(~video_mask_un, -1e18)
+        # similarity_matrix_weight = torch.softmax(4*similarity_matrix_weight, dim=1) # normalization between frames for each frame
+        # similarity_matrix = similarity_matrix_weight * similarity_matrix
+        # similarity_matrix = torch.sum(similarity_matrix, dim=1)
+        # ##########  softmax nomalize  ####################
 
         similarity_matrix = similarity_matrix.T # transpose here due to before transpose
         logit_scale = self.clip.logit_scale.exp()
